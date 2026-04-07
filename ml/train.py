@@ -103,8 +103,10 @@ DEFAULT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(config: dict) -> Pipeline:
+    imputer = SimpleImputer(strategy="median")
+    imputer.set_output(transform="pandas")  # preserves feature names → no LGBMRegressor warning
     return Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", imputer),
         ("model", MultiOutputRegressor(LGBMRegressor(**config), n_jobs=4)),
     ])
 

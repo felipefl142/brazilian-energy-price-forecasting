@@ -1,16 +1,24 @@
 """
-Bronze layer: schema normalization, type casting, and weekly aggregation via DuckDB.
-Reads hive-partitioned raw Parquet and writes clean weekly files:
+Bronze layer: schema normalization, type casting, subsystem mapping, and weekly aggregation.
+Reads hive-partitioned raw Parquet (as downloaded by collect.py) and writes clean weekly files.
 
-  data/bronze/pld.parquet          — weekly PLD per subsystem (R$/MWh)
-  data/bronze/reservoir.parquet    — weekly reservoir level (%) + ENA (GWh) per subsystem
-  data/bronze/generation.parquet   — weekly generation by source, national (MW avg)
-  data/bronze/load.parquet         — weekly load per subsystem (MWh/week)
-  data/bronze/interconnection.parquet  — weekly net interchange flows (MWh/week)
-  data/bronze/weather.parquet      — weekly weather per subsystem city (precip, temp)
+Output files (data/bronze/):
+  pld.parquet           — weekly PLD per subsystem (R$/MWh)
+  reservoir.parquet     — weekly reservoir storage (%) + ENA (GWh) per subsystem
+  generation.parquet    — weekly generation by fuel type, national (avg MW)
+  load.parquet          — weekly load per subsystem (MWh)
+  interconnection.parquet — daily interchange flows per subsystem pair (avg MWmed)
+  weather.parquet       — weekly weather per subsystem city (precip mm, temp °C)
 
-IMPORTANT: Column name mappings in each function must match the actual ONS API response.
-Run notebook 01_data_ingestion.ipynb first to inspect raw schemas and update mappings here.
+Raw column names (verified April 2026):
+  EAR:           id_subsistema, ear_data, ear_verif_subsistema_percentual
+  ENA:           id_subsistema, ena_data, ena_armazenavel_regiao_mwmed
+  Load:          id_subsistema, din_instante, val_cargaenergiamwmed
+  Generation:    din_instante, nom_tipocombustivel, val_geracao (string MWmed)
+  Interconnect:  din_instante, id_subsistema_origem, id_subsistema_destino, val_intercambiomwmed
+
+Subsystem ID mapping (ONS → project standard):
+  SE → SE/CO,  S → S,  NE → NE,  N → N
 
 Usage:
     python -m etl.bronze
@@ -25,9 +33,60 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 RAW_DIR = BASE_DIR / "data" / "raw"
 BRONZE_DIR = BASE_DIR / "data" / "bronze"
 
+# DuckDB CASE expression to map ONS id_subsistema → project standard name
+# Applied to any column that holds the ONS single-letter codes (SE, S, NE, N)
+_SUBSYS_MAP = """
+    CASE {col}
+        WHEN 'SE' THEN 'SE/CO'
+        WHEN 'S'  THEN 'S'
+        WHEN 'NE' THEN 'NE'
+        WHEN 'N'  THEN 'N'
+        ELSE TRIM(CAST({col} AS VARCHAR))
+    END
+"""
+
+# Standard generation fuel type mapping: ONS Portuguese → project codes
+_FUEL_MAP = """
+    CASE TRIM(nom_tipocombustivel)
+        WHEN 'Hidráulica'      THEN 'HIDRO'
+        WHEN 'Eólica'          THEN 'EOLICA'
+        WHEN 'Solar'           THEN 'SOLAR'
+        WHEN 'Nuclear'         THEN 'NUCLEAR'
+        WHEN 'Gás'             THEN 'TERMELETRICA'
+        WHEN 'Óleo Diesel'     THEN 'TERMELETRICA'
+        WHEN 'Óleo Combustível' THEN 'TERMELETRICA'
+        WHEN 'Carvão'          THEN 'TERMELETRICA'
+        WHEN 'Biomassa'        THEN 'TERMELETRICA'
+        ELSE NULL
+    END
+"""
+
+# PLD uses Friday as week_start (confirmed from raw data: all week_start dates are Fridays).
+# Aggregate daily observations into the same Friday-starting weeks so JOIN keys align.
+#
+# Formula: date - ((DOW + 2) % 7) days, where DOW is DuckDB's 0=Sun … 6=Sat convention.
+#   Friday (5): (5+2)%7 = 0  → 0 days back = Friday ✓
+#   Saturday(6): (6+2)%7 = 1  → 1 day  back = Friday ✓
+#   Sunday (0): (0+2)%7 = 2  → 2 days back = Friday ✓
+#   Monday (1): (1+2)%7 = 3  → 3 days back = Friday ✓
+#   Tuesday(2): (2+2)%7 = 4  → 4 days back = Friday ✓
+#   Wednesday(3): (3+2)%7 = 5  → 5 days back = Friday ✓
+#   Thursday(4): (4+2)%7 = 6  → 6 days back = Friday ✓  (assigns Thu to prior week's Friday)
+def _friday_week(date_col: str) -> str:
+    """Return the Friday that starts the ISO-like week containing date_col."""
+    return (
+        f"(TRY_CAST({date_col} AS DATE)"
+        f" - CAST(((EXTRACT(DOW FROM TRY_CAST({date_col} AS DATE))::INT + 2) % 7) AS INT)"
+        f" * INTERVAL '1 day')"
+    )
+
 
 def _row_count(con: duckdb.DuckDBPyConnection, path: Path) -> int:
     return con.execute(f"SELECT COUNT(*) FROM read_parquet('{path}')").fetchone()[0]
+
+
+def _raw_glob(source: str) -> str:
+    return str(RAW_DIR / source / "**" / "*.parquet")
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +94,7 @@ def _row_count(con: duckdb.DuckDBPyConnection, path: Path) -> int:
 # ---------------------------------------------------------------------------
 
 def _build_pld(con: duckdb.DuckDBPyConnection):
-    raw = str(RAW_DIR / "pld" / "**" / "*.parquet")
+    raw = _raw_glob("pld")
     out = str(BRONZE_DIR / "pld.parquet")
     print("  [Bronze] Building pld.parquet...")
     con.execute(f"""
@@ -48,8 +107,8 @@ def _build_pld(con: duckdb.DuckDBPyConnection):
             WHERE week_start IS NOT NULL
               AND pld_brl_mwh IS NOT NULL
             QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY CAST(week_start AS DATE), TRIM(CAST(subsystem AS VARCHAR))
-                ORDER BY CAST(week_start AS DATE)
+                PARTITION BY TRY_CAST(week_start AS DATE), TRIM(CAST(subsystem AS VARCHAR))
+                ORDER BY TRY_CAST(week_start AS DATE)
             ) = 1
             ORDER BY week_start, subsystem
         ) TO '{out}' (FORMAT PARQUET)
@@ -58,89 +117,105 @@ def _build_pld(con: duckdb.DuckDBPyConnection):
 
 
 # ---------------------------------------------------------------------------
-# Reservoir + ENA
+# Reservoir (EAR) + ENA → reservoir.parquet
 # ---------------------------------------------------------------------------
-# Expected ONS columns (verify in notebook 01):
-#   reservoir: date col (e.g. dat_referencia), subsystem col, reservoir_pct col
-#   ena:       date col, subsystem col, ena_gwh col
-# We combine both into one bronze table keyed by (week_start, subsystem).
 
 def _build_reservoir(con: duckdb.DuckDBPyConnection):
-    raw_reservoir = str(RAW_DIR / "reservoir" / "**" / "*.parquet")
-    raw_ena = str(RAW_DIR / "ena" / "**" / "*.parquet")
+    raw_ear = _raw_glob("reservoir")
+    raw_ena = _raw_glob("ena")
     out = str(BRONZE_DIR / "reservoir.parquet")
-    print("  [Bronze] Building reservoir.parquet (reservoir + ENA)...")
+    print("  [Bronze] Building reservoir.parquet (EAR + ENA)...")
 
-    # Load reservoir raw and inspect columns interactively (run notebook 01 first)
-    # Placeholder column names — UPDATE these after running notebook 01:
-    #   dat_semana_inicio → week start date
-    #   nom_submercado    → subsystem name (SE/CO, S, NE, N)
-    #   val_pct_volume_util → reservoir % of useful volume
-    #   val_ena_bruta_gwh   → ENA (GWh weekly)
-    try:
-        df_res = con.execute(f"""
-            SELECT
-                CAST(dat_semana_inicio AS DATE)            AS week_start,
-                TRIM(CAST(nom_submercado AS VARCHAR))      AS subsystem,
-                TRY_CAST(val_pct_volume_util AS DOUBLE)   AS reservoir_pct
-            FROM read_parquet('{raw_reservoir}', hive_partitioning=true)
-            WHERE dat_semana_inicio IS NOT NULL
-        """).fetchdf()
-    except Exception as e:
-        print(f"    WARNING: reservoir fetch failed ({e}) — using empty frame")
-        df_res = pd.DataFrame(columns=["week_start", "subsystem", "reservoir_pct"])
+    # EAR: daily → weekly average of storage %
+    # Columns: id_subsistema, ear_data (date string), ear_verif_subsistema_percentual
+    ear_ok = (RAW_DIR / "reservoir").exists()
+    ena_ok = (RAW_DIR / "ena").exists()
 
-    try:
-        df_ena = con.execute(f"""
-            SELECT
-                CAST(dat_semana_inicio AS DATE)           AS week_start,
-                TRIM(CAST(nom_submercado AS VARCHAR))     AS subsystem,
-                TRY_CAST(val_ena_bruta_gwh AS DOUBLE)    AS ena_gwh
-            FROM read_parquet('{raw_ena}', hive_partitioning=true)
-            WHERE dat_semana_inicio IS NOT NULL
-        """).fetchdf()
-    except Exception as e:
-        print(f"    WARNING: ENA fetch failed ({e}) — using empty frame")
-        df_ena = pd.DataFrame(columns=["week_start", "subsystem", "ena_gwh"])
-
-    if df_res.empty and df_ena.empty:
-        print("    → No reservoir/ENA data available yet.")
+    if not ear_ok and not ena_ok:
+        print("    → No reservoir/ENA data found, skipping.")
         return
 
-    df = pd.merge(df_res, df_ena, on=["week_start", "subsystem"], how="outer")
-    df = df.sort_values(["week_start", "subsystem"])
+    subsys_map = _SUBSYS_MAP.replace("{col}", "id_subsistema")
+
+    if ear_ok:
+        try:
+            df_ear = con.execute(f"""
+                SELECT
+                    {_friday_week('ear_data')} AS week_start,
+                    {subsys_map} AS subsystem,
+                    AVG(TRY_CAST(ear_verif_subsistema_percentual AS DOUBLE)) AS reservoir_pct
+                FROM read_parquet('{raw_ear}', hive_partitioning=true)
+                WHERE ear_data IS NOT NULL
+                  AND ear_verif_subsistema_percentual IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """).fetchdf()
+        except Exception as e:
+            print(f"    WARNING: EAR build failed ({e})")
+            df_ear = pd.DataFrame(columns=["week_start", "subsystem", "reservoir_pct"])
+    else:
+        df_ear = pd.DataFrame(columns=["week_start", "subsystem", "reservoir_pct"])
+
+    # ENA: daily → weekly sum of inflows
+    # ena_armazenavel_regiao_mwmed (daily avg MW) × 24h × 7 days / 1000 = GWh/week
+    # Stored as GWh (weekly total); the anomaly ratio in silver normalises the unit.
+    if ena_ok:
+        try:
+            df_ena = con.execute(f"""
+                SELECT
+                    {_friday_week('ena_data')} AS week_start,
+                    {subsys_map} AS subsystem,
+                    SUM(TRY_CAST(ena_armazenavel_regiao_mwmed AS DOUBLE)) * 24.0 / 1000.0 AS ena_gwh
+                FROM read_parquet('{raw_ena}', hive_partitioning=true)
+                WHERE ena_data IS NOT NULL
+                  AND ena_armazenavel_regiao_mwmed IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 2
+            """).fetchdf()
+        except Exception as e:
+            print(f"    WARNING: ENA build failed ({e})")
+            df_ena = pd.DataFrame(columns=["week_start", "subsystem", "ena_gwh"])
+    else:
+        df_ena = pd.DataFrame(columns=["week_start", "subsystem", "ena_gwh"])
+
+    if df_ear.empty and df_ena.empty:
+        print("    → Both EAR and ENA are empty, skipping.")
+        return
+
+    df = pd.merge(df_ear, df_ena, on=["week_start", "subsystem"], how="outer")
+    df = df.sort_values(["week_start", "subsystem"]).reset_index(drop=True)
     df.to_parquet(out, index=False)
     print(f"    → {len(df):,} rows")
 
 
 # ---------------------------------------------------------------------------
-# Generation by source (national weekly)
+# Generation by fuel type (national weekly avg MW)
 # ---------------------------------------------------------------------------
 
 def _build_generation(con: duckdb.DuckDBPyConnection):
-    raw = str(RAW_DIR / "generation" / "**" / "*.parquet")
+    raw = _raw_glob("generation")
     out = str(BRONZE_DIR / "generation.parquet")
     print("  [Bronze] Building generation.parquet...")
-    # Expected ONS columns (UPDATE after running notebook 01):
-    #   dat_semana_inicio  → week start
-    #   nom_tipo_geracao   → source type (HIDRO, EOLICA, SOLAR, TERMELETRICA, NUCLEAR)
-    #   val_geracao_mwmed  → average generation MW for the week
+
+    if not (RAW_DIR / "generation").exists():
+        print("    → No generation data found, skipping.")
+        return
+
+    # val_geracao is stored as string (e.g. "2234.70000000") — use TRY_CAST
+    # Aggregate: SUM of plant-level daily MWmed → weekly avg MW per fuel type nationally
+    # (sum all plants in all subsystems, then average over days in the week)
     try:
         con.execute(f"""
             COPY (
                 SELECT
-                    CAST(dat_semana_inicio AS DATE)           AS week_start,
-                    TRIM(UPPER(CAST(nom_tipo_geracao AS VARCHAR))) AS source,
-                    TRY_CAST(val_geracao_mwmed AS DOUBLE)    AS generation_avg_mw
+                    {_friday_week('din_instante')} AS week_start,
+                    {_FUEL_MAP} AS source,
+                    AVG(TRY_CAST(val_geracao AS DOUBLE))               AS generation_avg_mw
                 FROM read_parquet('{raw}', hive_partitioning=true)
-                WHERE dat_semana_inicio IS NOT NULL
-                  AND val_geracao_mwmed IS NOT NULL
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY CAST(dat_semana_inicio AS DATE),
-                                 TRIM(UPPER(CAST(nom_tipo_geracao AS VARCHAR)))
-                    ORDER BY CAST(dat_semana_inicio AS DATE)
-                ) = 1
-                ORDER BY week_start, source
+                WHERE din_instante IS NOT NULL
+                  AND ({_FUEL_MAP}) IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 2
             ) TO '{out}' (FORMAT PARQUET)
         """)
         print(f"    → {_row_count(con, Path(out)):,} rows")
@@ -149,33 +224,33 @@ def _build_generation(con: duckdb.DuckDBPyConnection):
 
 
 # ---------------------------------------------------------------------------
-# Load by subsystem (weekly)
+# Load by subsystem (weekly MWh)
 # ---------------------------------------------------------------------------
 
 def _build_load(con: duckdb.DuckDBPyConnection):
-    raw = str(RAW_DIR / "load" / "**" / "*.parquet")
+    raw = _raw_glob("load")
     out = str(BRONZE_DIR / "load.parquet")
     print("  [Bronze] Building load.parquet...")
-    # Expected ONS columns (UPDATE after notebook 01):
-    #   dat_semana_inicio  → week start
-    #   nom_submercado     → subsystem
-    #   val_carga_energia  → energy consumed (MWh/week)
+
+    if not (RAW_DIR / "load").exists():
+        print("    → No load data found, skipping.")
+        return
+
+    subsys_map = _SUBSYS_MAP.replace("{col}", "id_subsistema")
+
+    # val_cargaenergiamwmed = daily avg MW → weekly MWh = sum(daily MWmed) × 24h
     try:
         con.execute(f"""
             COPY (
                 SELECT
-                    CAST(dat_semana_inicio AS DATE)           AS week_start,
-                    TRIM(CAST(nom_submercado AS VARCHAR))     AS subsystem,
-                    TRY_CAST(val_carga_energia AS DOUBLE)    AS load_mwh
+                    {_friday_week('din_instante')} AS week_start,
+                    {subsys_map} AS subsystem,
+                    SUM(TRY_CAST(val_cargaenergiamwmed AS DOUBLE)) * 24.0 AS load_mwh
                 FROM read_parquet('{raw}', hive_partitioning=true)
-                WHERE dat_semana_inicio IS NOT NULL
-                  AND val_carga_energia IS NOT NULL
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY CAST(dat_semana_inicio AS DATE),
-                                 TRIM(CAST(nom_submercado AS VARCHAR))
-                    ORDER BY CAST(dat_semana_inicio AS DATE)
-                ) = 1
-                ORDER BY week_start, subsystem
+                WHERE din_instante IS NOT NULL
+                  AND val_cargaenergiamwmed IS NOT NULL
+                GROUP BY 1, 2
+                ORDER BY 1, 2
             ) TO '{out}' (FORMAT PARQUET)
         """)
         print(f"    → {_row_count(con, Path(out)):,} rows")
@@ -184,36 +259,36 @@ def _build_load(con: duckdb.DuckDBPyConnection):
 
 
 # ---------------------------------------------------------------------------
-# Interconnection flows (weekly, net per subsystem pair)
+# Interconnection flows (weekly avg MWmed per subsystem pair)
 # ---------------------------------------------------------------------------
 
 def _build_interconnection(con: duckdb.DuckDBPyConnection):
-    raw = str(RAW_DIR / "interconnection" / "**" / "*.parquet")
+    raw = _raw_glob("interconnection")
     out = str(BRONZE_DIR / "interconnection.parquet")
     print("  [Bronze] Building interconnection.parquet...")
-    # Expected ONS columns (UPDATE after notebook 01):
-    #   dat_semana_inicio    → week start
-    #   nom_submercado_orig  → origin subsystem
-    #   nom_submercado_dest  → destination subsystem
-    #   val_intercambio_mwh  → interchange energy (MWh/week)
+
+    if not (RAW_DIR / "interconnection").exists():
+        print("    → No interconnection data found, skipping.")
+        return
+
+    from_map = _SUBSYS_MAP.replace("{col}", "id_subsistema_origem")
+    to_map   = _SUBSYS_MAP.replace("{col}", "id_subsistema_destino")
+
+    # val_intercambiomwmed = daily avg MW (positive = flow from origem to destino)
+    # Store weekly avg MWmed (preserves sign convention)
     try:
         con.execute(f"""
             COPY (
                 SELECT
-                    CAST(dat_semana_inicio AS DATE)               AS week_start,
-                    TRIM(CAST(nom_submercado_orig AS VARCHAR))    AS from_subsystem,
-                    TRIM(CAST(nom_submercado_dest AS VARCHAR))    AS to_subsystem,
-                    TRY_CAST(val_intercambio_mwh AS DOUBLE)      AS flow_mwh
+                    {_friday_week('din_instante')} AS week_start,
+                    {from_map} AS from_subsystem,
+                    {to_map}   AS to_subsystem,
+                    AVG(TRY_CAST(val_intercambiomwmed AS DOUBLE))      AS flow_mwmed
                 FROM read_parquet('{raw}', hive_partitioning=true)
-                WHERE dat_semana_inicio IS NOT NULL
-                  AND val_intercambio_mwh IS NOT NULL
-                QUALIFY ROW_NUMBER() OVER (
-                    PARTITION BY CAST(dat_semana_inicio AS DATE),
-                                 TRIM(CAST(nom_submercado_orig AS VARCHAR)),
-                                 TRIM(CAST(nom_submercado_dest AS VARCHAR))
-                    ORDER BY CAST(dat_semana_inicio AS DATE)
-                ) = 1
-                ORDER BY week_start, from_subsystem, to_subsystem
+                WHERE din_instante IS NOT NULL
+                  AND val_intercambiomwmed IS NOT NULL
+                GROUP BY 1, 2, 3
+                ORDER BY 1, 2, 3
             ) TO '{out}' (FORMAT PARQUET)
         """)
         print(f"    → {_row_count(con, Path(out)):,} rows")
@@ -226,15 +301,20 @@ def _build_interconnection(con: duckdb.DuckDBPyConnection):
 # ---------------------------------------------------------------------------
 
 def _build_weather(con: duckdb.DuckDBPyConnection):
-    raw = str(RAW_DIR / "weather" / "**" / "*.parquet")
+    raw = _raw_glob("weather")
     out = str(BRONZE_DIR / "weather.parquet")
     print("  [Bronze] Building weather.parquet (weekly aggregation)...")
+
+    if not (RAW_DIR / "weather").exists():
+        print("    → No weather data found, skipping.")
+        return
+
     try:
         con.execute(f"""
             COPY (
                 SELECT
-                    DATE_TRUNC('week', CAST(date AS DATE)) AS week_start,
-                    TRIM(CAST(subsystem AS VARCHAR))       AS subsystem,
+                    {_friday_week('date')} AS week_start,
+                    TRIM(CAST(subsystem AS VARCHAR))           AS subsystem,
                     SUM(TRY_CAST(precip_mm AS DOUBLE))        AS precip_mm_sum,
                     AVG(TRY_CAST(temp_c AS DOUBLE))           AS temp_c_avg,
                     AVG(TRY_CAST(wind_speed_kmh AS DOUBLE))   AS wind_speed_avg,
@@ -242,7 +322,7 @@ def _build_weather(con: duckdb.DuckDBPyConnection):
                 FROM read_parquet('{raw}', hive_partitioning=true)
                 WHERE date IS NOT NULL
                 GROUP BY 1, 2
-                ORDER BY week_start, subsystem
+                ORDER BY 1, 2
             ) TO '{out}' (FORMAT PARQUET)
         """)
         print(f"    → {_row_count(con, Path(out)):,} rows")

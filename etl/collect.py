@@ -9,12 +9,21 @@ Usage:
     python -m etl.collect --start 2025-01-01 --end 2025-12-31 --force
 
 Data sources:
-    - PLD/CMO: ONS dados.ons.org.br (weekly CMO per subsystem, available from 2005)
-    - ONS: dados.ons.org.br CKAN REST API (load, generation, reservoir, ENA, interconnection)
-    - Weather: Open-Meteo archive API (hourly → aggregated weekly per subsystem city)
+    - PLD/CMO: ONS dados.ons.org.br (weekly CMO per subsystem, S3-hosted CSV by year)
+    - ONS grid: dados.ons.org.br S3 (EAR, ENA, load, generation, interconnection — Parquet/CSV by year)
+    - Weather: Open-Meteo archive API (hourly → aggregated daily, 4 cities per subsystem)
+
+ONS S3 URL patterns (verified April 2026 via package_show API):
+    EAR:            ear_subsistema_di/EAR_DIARIO_SUBSISTEMA_{year}.parquet        (2000+)
+    ENA:            ena_subsistema_di/ENA_DIARIO_SUBSISTEMA_{year}.{ext}           (parquet 2021+, csv 2000–2020)
+    Load:           carga_energia_di/CARGA_ENERGIA_{year}.parquet                 (2000+)
+    Generation:     geracao_usina_2_ho/GERACAO_USINA-2_{year}.parquet             (annual 2000–2021)
+                    geracao_usina_2_ho/GERACAO_USINA-2_{year}_{mm:02d}.parquet    (monthly 2022+)
+    Interconnection: intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.{ext}   (parquet 2023+, csv 2000–2022)
 """
 
 import argparse
+import io
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,25 +48,14 @@ SUBSYSTEM_CITIES = {
     "N":     {"lat": -1.45,  "lon": -48.50, "name": "Belém"},
 }
 
-# ONS CMO (Custo Marginal de Operação) — weekly, per subsystem
-# CSV files hosted on S3, discovered via dados.ons.org.br package 'cmo-semanal'
-# Available from 2005 onwards. Column val_cmomediasemanal ≈ PLD (R$/MWh).
+# ONS CMO S3 template
 ONS_CMO_CSV_TEMPLATE = (
     "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset/cmo_se/CMO_SEMANAL_{year}.csv"
 )
-# Subsystem ID mapping: ONS short code → project standard name
 ONS_SUBSYSTEM_MAP = {"SE": "SE/CO", "S": "S", "NE": "NE", "N": "N"}
 
-# ONS CKAN API resource IDs
-# Verify at: https://dados.ons.org.br
-ONS_BASE = "https://dados.ons.org.br/api/3/action/datastore_search"
-ONS_RESOURCES = {
-    "reservoir": "RESERVATORIO_NIVEL",        # Reservoir storage level (% useful volume)
-    "ena":       "ENA_SEMANA_SUBMERCADO",      # ENA weekly by subsystem (GWh)
-    "load":      "CARGA_ENERGIA_SUBMERCADO",   # Load by subsystem (weekly or daily)
-    "generation":"GERACAO_FONTE_ONS",          # Generation by source (MW, may need weekly agg)
-    "interconnection": "INTERCAMBIO_SEMANAL",  # Weekly interchange flows
-}
+# ONS Open Data S3 base
+ONS_S3 = "https://ons-aws-prod-opendata.s3.amazonaws.com/dataset"
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +63,6 @@ ONS_RESOURCES = {
 # ---------------------------------------------------------------------------
 
 def _year_range(start: datetime, end: datetime):
-    """Yield year integers from start to end inclusive."""
     for year in range(start.year, end.year + 1):
         yield year
 
@@ -82,26 +79,27 @@ def _already_collected(source: str, year: int, force: bool) -> bool:
     return False
 
 
-def _ons_fetch_all(resource_id: str, filters: dict | None = None) -> pd.DataFrame:
-    """Paginate through the ONS CKAN API and return all records as a DataFrame."""
-    offset = 0
-    limit = 5000
-    records = []
-    while True:
-        params = {"resource_id": resource_id, "limit": limit, "offset": offset}
-        if filters:
-            params.update(filters)
-        resp = requests.get(ONS_BASE, params=params, timeout=30)
-        resp.raise_for_status()
-        batch = resp.json()["result"]["records"]
-        if not batch:
-            break
-        records.extend(batch)
-        offset += limit
-        if len(batch) < limit:
-            break
-        time.sleep(0.2)
-    return pd.DataFrame(records) if records else pd.DataFrame()
+def _get(url: str) -> requests.Response | None:
+    """GET with 60s timeout. Returns None on 404, raises on other HTTP errors."""
+    resp = requests.get(url, timeout=60)
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    return resp
+
+
+def _read_parquet_url(url: str) -> pd.DataFrame | None:
+    resp = _get(url)
+    if resp is None:
+        return None
+    return pd.read_parquet(io.BytesIO(resp.content))
+
+
+def _read_csv_url(url: str, sep: str = ";") -> pd.DataFrame | None:
+    resp = _get(url)
+    if resp is None:
+        return None
+    return pd.read_csv(io.StringIO(resp.text), sep=sep)
 
 
 # ---------------------------------------------------------------------------
@@ -156,57 +154,86 @@ class CollectPLD:
 
 
 # ---------------------------------------------------------------------------
-# ONS — Reservoir levels + ENA
+# ONS grid data — direct S3 file downloads per year
 # ---------------------------------------------------------------------------
 
 class CollectONS:
     """
-    Fetches grid data from ONS Open Data portal (dados.ons.org.br).
-    Each dataset is fetched in full and split by year for partitioned storage.
+    Downloads ONS grid datasets from S3-hosted files (one per year or month).
+    All files are on ons-aws-prod-opendata.s3.amazonaws.com — no auth required.
 
-    IMPORTANT: Resource IDs in ONS_RESOURCES must be verified against the portal.
-    Visit https://dados.ons.org.br to find current resource IDs.
-    Column names are inferred from the API response — check the notebook
-    01_data_ingestion.ipynb to validate schema after first run.
+    Raw column names are preserved as-is; bronze.py normalises them.
+
+    Datasets collected:
+      reservoir   — EAR daily by subsystem (% useful energy storage)
+      ena         — ENA daily by subsystem (natural inflows, MWmed)
+      load        — Daily energy load by subsystem (MWmed)
+      generation  — Daily generation by plant/fuel (MWmed), annual pre-2022 / monthly 2022+
+      interconnection — Daily interchange flows between subsystems (MWmed)
     """
 
-    def _fetch_and_save(self, source_key: str, resource_id: str,
-                        start: datetime, end: datetime, force: bool):
-        print(f"\n  [ONS/{source_key}] Fetching full dataset from resource {resource_id}...")
-        try:
-            df = _ons_fetch_all(resource_id)
-        except Exception as e:
-            print(f"  [ONS/{source_key}] ERROR fetching: {e}")
-            return
+    def _fetch_reservoir(self, year: int) -> pd.DataFrame | None:
+        url = f"{ONS_S3}/ear_subsistema_di/EAR_DIARIO_SUBSISTEMA_{year}.parquet"
+        return _read_parquet_url(url)
 
-        if df.empty:
-            print(f"  [ONS/{source_key}] WARNING: empty response")
-            return
+    def _fetch_ena(self, year: int) -> pd.DataFrame | None:
+        if year >= 2021:
+            url = f"{ONS_S3}/ena_subsistema_di/ENA_DIARIO_SUBSISTEMA_{year}.parquet"
+            return _read_parquet_url(url)
+        url = f"{ONS_S3}/ena_subsistema_di/ENA_DIARIO_SUBSISTEMA_{year}.csv"
+        df = _read_csv_url(url)
+        return df
 
-        # Detect the date column (first column containing 'dat' or 'data' case-insensitively)
-        date_col = next(
-            (c for c in df.columns if "dat" in c.lower() or "semana" in c.lower()),
-            df.columns[0],
-        )
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df = df.dropna(subset=[date_col])
-        df["_year"] = df[date_col].dt.year
+    def _fetch_load(self, year: int) -> pd.DataFrame | None:
+        url = f"{ONS_S3}/carga_energia_di/CARGA_ENERGIA_{year}.parquet"
+        return _read_parquet_url(url)
 
-        for year in _year_range(start, end):
-            if _already_collected(source_key, year, force):
-                continue
-            year_df = df[df["_year"] == year].drop(columns=["_year"]).copy()
-            if year_df.empty:
-                print(f"  [ONS/{source_key}] {year}: no data")
-                continue
-            out = _partition_path(source_key, year)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            year_df.to_parquet(out, index=False)
-            print(f"  [ONS/{source_key}] {year}: {len(year_df)} rows → {out}")
+    def _fetch_generation(self, year: int) -> pd.DataFrame | None:
+        if year >= 2022:
+            frames = []
+            for month in range(1, 13):
+                url = f"{ONS_S3}/geracao_usina_2_ho/GERACAO_USINA-2_{year}_{month:02d}.parquet"
+                df = _read_parquet_url(url)
+                if df is not None and not df.empty:
+                    frames.append(df)
+            return pd.concat(frames, ignore_index=True) if frames else None
+        url = f"{ONS_S3}/geracao_usina_2_ho/GERACAO_USINA-2_{year}.parquet"
+        return _read_parquet_url(url)
+
+    def _fetch_interconnection(self, year: int) -> pd.DataFrame | None:
+        if year >= 2023:
+            url = f"{ONS_S3}/intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.parquet"
+            return _read_parquet_url(url)
+        url = f"{ONS_S3}/intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.csv"
+        return _read_csv_url(url)
+
+    def _save(self, source_key: str, year: int, df: pd.DataFrame):
+        out = _partition_path(source_key, year)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(out, index=False)
+        print(f"  [ONS/{source_key}] {year}: {len(df):,} rows → {out}")
 
     def process(self, start: datetime, end: datetime, force: bool = False):
-        for source_key, resource_id in ONS_RESOURCES.items():
-            self._fetch_and_save(source_key, resource_id, start, end, force)
+        sources = {
+            "reservoir": self._fetch_reservoir,
+            "ena":        self._fetch_ena,
+            "load":       self._fetch_load,
+            "generation": self._fetch_generation,
+            "interconnection": self._fetch_interconnection,
+        }
+        for source_key, fetch_fn in sources.items():
+            print(f"\n[ONS/{source_key}] Starting collection...")
+            for year in tqdm(list(_year_range(start, end)), desc=source_key):
+                if _already_collected(source_key, year, force):
+                    continue
+                try:
+                    df = fetch_fn(year)
+                    if df is None or df.empty:
+                        print(f"  [ONS/{source_key}] {year}: no data")
+                        continue
+                    self._save(source_key, year, df)
+                except Exception as e:
+                    print(f"  [ONS/{source_key}] {year} ERROR: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +241,15 @@ class CollectONS:
 # ---------------------------------------------------------------------------
 
 WEATHER_VARIABLES = [
-    "precipitation_sum",    # daily sum (mm)
-    "temperature_2m_mean",  # daily mean (°C)
-    "wind_speed_10m_mean",  # daily mean (km/h)
-    "shortwave_radiation_sum",  # daily sum (MJ/m²)
+    "precipitation_sum",       # daily sum (mm)
+    "temperature_2m_mean",     # daily mean (°C)
+    "wind_speed_10m_mean",     # daily mean (km/h)
+    "shortwave_radiation_sum", # daily sum (MJ/m²)
 ]
+
+# Open-Meteo free tier: ~600 requests/hour. Use 3s between city requests
+# (4 cities × 20 years = 80 requests ≈ 4 min total for a full backfill).
+_WEATHER_SLEEP_BETWEEN_CITIES = 3.0
 
 
 class CollectWeather:
@@ -229,7 +260,8 @@ class CollectWeather:
 
     def __init__(self):
         cache_session = requests_cache.CachedSession(".weather_cache", expire_after=-1)
-        retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+        # backoff_factor=2 → waits 4s / 8s / 16s / 32s / 64s on retries
+        retry_session = retry(cache_session, retries=5, backoff_factor=2)
         self.client = openmeteo_requests.Client(session=retry_session)
 
     def _fetch_city(self, subsystem: str, lat: float, lon: float,
@@ -280,7 +312,7 @@ class CollectWeather:
                         subsystem, city["lat"], city["lon"], start_date, end_date
                     )
                     frames.append(df)
-                    time.sleep(0.2)
+                    time.sleep(_WEATHER_SLEEP_BETWEEN_CITIES)
 
                 combined = pd.concat(frames, ignore_index=True)
                 out = _partition_path("weather", year)
