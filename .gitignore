@@ -1,0 +1,16 @@
+data/
+models/
+aim_logs/
+.weather_cache*
+.env
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+feature_store/data/
+memory/
