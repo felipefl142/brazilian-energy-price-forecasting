@@ -32,14 +32,18 @@ WITH pld_wide AS (
 reservoir_wide AS (
     SELECT
         week_start,
-        MAX(CASE WHEN subsystem = 'SE/CO' THEN reservoir_pct END) AS reservoir_pct_seco,
-        MAX(CASE WHEN subsystem = 'S'     THEN reservoir_pct END) AS reservoir_pct_s,
-        MAX(CASE WHEN subsystem = 'NE'    THEN reservoir_pct END) AS reservoir_pct_ne,
-        MAX(CASE WHEN subsystem = 'N'     THEN reservoir_pct END) AS reservoir_pct_n,
-        MAX(CASE WHEN subsystem = 'SE/CO' THEN ena_gwh END)       AS ena_seco,
-        MAX(CASE WHEN subsystem = 'S'     THEN ena_gwh END)       AS ena_s,
-        MAX(CASE WHEN subsystem = 'NE'    THEN ena_gwh END)       AS ena_ne,
-        MAX(CASE WHEN subsystem = 'N'     THEN ena_gwh END)       AS ena_n
+        MAX(CASE WHEN subsystem = 'SE/CO' THEN reservoir_pct END)     AS reservoir_pct_seco,
+        MAX(CASE WHEN subsystem = 'S'     THEN reservoir_pct END)     AS reservoir_pct_s,
+        MAX(CASE WHEN subsystem = 'NE'    THEN reservoir_pct END)     AS reservoir_pct_ne,
+        MAX(CASE WHEN subsystem = 'N'     THEN reservoir_pct END)     AS reservoir_pct_n,
+        MAX(CASE WHEN subsystem = 'SE/CO' THEN reservoir_mwmonth END) AS reservoir_mwmonth_seco,
+        MAX(CASE WHEN subsystem = 'S'     THEN reservoir_mwmonth END) AS reservoir_mwmonth_s,
+        MAX(CASE WHEN subsystem = 'NE'    THEN reservoir_mwmonth END) AS reservoir_mwmonth_ne,
+        MAX(CASE WHEN subsystem = 'N'     THEN reservoir_mwmonth END) AS reservoir_mwmonth_n,
+        MAX(CASE WHEN subsystem = 'SE/CO' THEN ena_gwh END)           AS ena_seco,
+        MAX(CASE WHEN subsystem = 'S'     THEN ena_gwh END)           AS ena_s,
+        MAX(CASE WHEN subsystem = 'NE'    THEN ena_gwh END)           AS ena_ne,
+        MAX(CASE WHEN subsystem = 'N'     THEN ena_gwh END)           AS ena_n
     FROM read_parquet('{reservoir_path}')
     GROUP BY week_start
 ),
@@ -73,6 +77,7 @@ weekly_raw AS (
         p.week_start,
         p.pld_seco, p.pld_s, p.pld_ne, p.pld_n,
         r.reservoir_pct_seco, r.reservoir_pct_s, r.reservoir_pct_ne, r.reservoir_pct_n,
+        r.reservoir_mwmonth_seco, r.reservoir_mwmonth_s, r.reservoir_mwmonth_ne, r.reservoir_mwmonth_n,
         r.ena_seco, r.ena_s, r.ena_ne, r.ena_n,
         g.hydro_share, g.wind_share, g.solar_share, g.thermal_share, g.nuclear_share,
         g.total_mw
@@ -91,6 +96,7 @@ weekly_features AS (
         -- Raw current values (NOT used as features — targets are derived from these)
         pld_seco, pld_s, pld_ne, pld_n,
         reservoir_pct_seco, reservoir_pct_s, reservoir_pct_ne, reservoir_pct_n,
+        reservoir_mwmonth_seco, reservoir_mwmonth_s, reservoir_mwmonth_ne, reservoir_mwmonth_n,
         ena_seco, ena_s, ena_ne, ena_n,
         hydro_share, wind_share, solar_share, thermal_share, nuclear_share,
 
@@ -145,6 +151,18 @@ weekly_features AS (
         AVG(reservoir_pct_s)    OVER (ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) AS reservoir_s_roll_4w,
         AVG(reservoir_pct_ne)   OVER (ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) AS reservoir_ne_roll_4w,
         AVG(reservoir_pct_n)    OVER (ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING) AS reservoir_n_roll_4w,
+
+        -- ---- RESERVOIR ABSOLUTE (MWmonth) LAGS — all subsystems ----
+        -- Complements the % feature: absolute level captures scale that % ignores
+        -- (e.g. 30% of 200,000 MWmonth vs 30% of 50,000 MWmonth are very different)
+        LAG(reservoir_mwmonth_seco, 1) OVER w AS reservoir_mwmonth_seco_lag_1w,
+        LAG(reservoir_mwmonth_s, 1)    OVER w AS reservoir_mwmonth_s_lag_1w,
+        LAG(reservoir_mwmonth_ne, 1)   OVER w AS reservoir_mwmonth_ne_lag_1w,
+        LAG(reservoir_mwmonth_n, 1)    OVER w AS reservoir_mwmonth_n_lag_1w,
+        LAG(reservoir_mwmonth_seco, 4) OVER w AS reservoir_mwmonth_seco_lag_4w,
+        LAG(reservoir_mwmonth_s, 4)    OVER w AS reservoir_mwmonth_s_lag_4w,
+        LAG(reservoir_mwmonth_ne, 4)   OVER w AS reservoir_mwmonth_ne_lag_4w,
+        LAG(reservoir_mwmonth_n, 4)    OVER w AS reservoir_mwmonth_n_lag_4w,
 
         -- ---- ENA LAGS (all subsystems) ----
         LAG(ena_seco, 1) OVER w AS ena_seco_lag_1w,

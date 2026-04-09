@@ -21,10 +21,13 @@ import duckdb
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.pipeline import Pipeline
 from lightgbm import LGBMRegressor
+
+from ml.imputer import MixedImputer
+
+PLD_STATS_PATH_NAME = "pld_stats.json"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 GOLD_DIR = BASE_DIR / "data" / "gold"
@@ -56,6 +59,13 @@ FEATURE_COLS = [
     "reservoir_seco_lag_4w", "reservoir_s_lag_4w", "reservoir_ne_lag_4w", "reservoir_n_lag_4w",
     "reservoir_seco_roll_4w", "reservoir_s_roll_4w", "reservoir_ne_roll_4w", "reservoir_n_roll_4w",
 
+    # Reservoir absolute (MWmonth) — all 4 subsystems, 2 lags each
+    # Captures scale that % ignores: 30% of 200k MWmonth ≠ 30% of 50k MWmonth
+    "reservoir_mwmonth_seco_lag_1w", "reservoir_mwmonth_s_lag_1w",
+    "reservoir_mwmonth_ne_lag_1w", "reservoir_mwmonth_n_lag_1w",
+    "reservoir_mwmonth_seco_lag_4w", "reservoir_mwmonth_s_lag_4w",
+    "reservoir_mwmonth_ne_lag_4w", "reservoir_mwmonth_n_lag_4w",
+
     # ENA — all 4 subsystems
     "ena_seco_lag_1w", "ena_s_lag_1w", "ena_ne_lag_1w", "ena_n_lag_1w",
     "ena_seco_roll_4w", "ena_s_roll_4w", "ena_ne_roll_4w", "ena_n_roll_4w",
@@ -63,6 +73,13 @@ FEATURE_COLS = [
     # ENA anomaly — this subsystem (ENA vs. historical avg for same week-of-year)
     # KEY FEATURE: values < 1 = drought year → high PLD
     "ena_anomaly",
+
+    # Thermal dispatch stress signals (national, 2022+; pre-2022 rows filled with 0)
+    # thermal_emergency: GFOM dispatch = ONS emergency override of merit order → leading PLD indicator
+    # thermal_nonmerit_share: (GFOM + inflexibility) / total generation → stress ratio
+    # NaN = no data collected (pre-2022), which semantically means no emergency dispatch → fill 0
+    "thermal_emergency_mwmed_lag_1w", "thermal_nonmerit_share_lag_1w",
+    "thermal_emergency_mwmed_roll_4w", "thermal_nonmerit_share_roll_4w",
 
     # Generation mix — national
     "hydro_share_lag_1w", "thermal_share_lag_1w", "wind_share_lag_1w", "solar_share_lag_1w",
@@ -98,13 +115,23 @@ DEFAULT_CONFIG = {
 }
 
 
+# Thermal dispatch features are NaN for pre-2022 rows because the dataset didn't exist yet.
+# NaN here means "no emergency dispatch occurred" (the correct interpretation), so fill with 0.
+# All other features use median imputation for the rare structural gaps (early ENA years, etc.).
+ZERO_FILL_FEATURES = [
+    "thermal_emergency_mwmed_lag_1w",
+    "thermal_nonmerit_share_lag_1w",
+    "thermal_emergency_mwmed_roll_4w",
+    "thermal_nonmerit_share_roll_4w",
+]
+
+
 # ---------------------------------------------------------------------------
 # Model builder
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(config: dict) -> Pipeline:
-    imputer = SimpleImputer(strategy="median")
-    imputer.set_output(transform="pandas")  # preserves feature names → no LGBMRegressor warning
+    imputer = MixedImputer(zero_fill_cols=ZERO_FILL_FEATURES)
     return Pipeline([
         ("imputer", imputer),
         ("model", MultiOutputRegressor(LGBMRegressor(**config), n_jobs=4)),
@@ -143,6 +170,18 @@ def train(train_df: pd.DataFrame, config: dict | None = None, aim_run=None) -> P
         aim_run["n_train_rows"] = len(X)
         aim_run["subsystems"] = ["SE/CO", "S", "NE", "N"]
 
+        # Log feature importances (mean across all 4 target estimators)
+        estimators = pipeline.named_steps["model"].estimators_
+        all_importances = np.stack([e.feature_importances_ for e in estimators])
+        mean_importances = all_importances.mean(axis=0)
+        # Store per-horizon importances as well
+        horizon_importances = {
+            f"t_plus_{h}w": dict(zip(FEATURE_COLS, all_importances[i].tolist()))
+            for i, h in enumerate([1, 2, 3, 4])
+        }
+        aim_run["feature_importances"] = dict(zip(FEATURE_COLS, mean_importances.tolist()))
+        aim_run["feature_importances_per_horizon"] = horizon_importances
+
     return pipeline
 
 
@@ -172,6 +211,16 @@ def main():
     con.close()
     print(f"  → {len(train_df):,} rows loaded")
 
+    # Save PLD distribution stats for evaluation thresholds
+    all_pld_train = train_df[TARGET_COLS].values.flatten()
+    pld_stats = {
+        "p50": float(np.percentile(all_pld_train, 50)),
+        "p75": float(np.percentile(all_pld_train, 75)),
+        "p90": float(np.percentile(all_pld_train, 90)),
+    }
+    (MODELS_DIR / PLD_STATS_PATH_NAME).write_text(json.dumps(pld_stats, indent=2))
+    print(f"  PLD stats saved (p50={pld_stats['p50']:.1f}, p75={pld_stats['p75']:.1f}, p90={pld_stats['p90']:.1f})")
+
     aim_run = None
     if not args.no_aim:
         try:
@@ -187,12 +236,13 @@ def main():
     model = train(train_df, config=config, aim_run=aim_run)
 
     print("\nEvaluating on training data (in-sample)...")
-    from ml.evaluate import evaluate_split, log_metrics_to_aim
-    train_metrics = evaluate_split(model, train_df, split_name="train")
+    from ml.evaluate import evaluate_split, log_metrics_to_aim, log_feature_importances_to_aim
+    train_metrics, _ = evaluate_split(model, train_df, split_name="train")
 
-    # Log metrics to Aim
+    # Log metrics and feature importances to Aim
     if aim_run is not None:
         log_metrics_to_aim(train_metrics, aim_run, prefix="train")
+        log_feature_importances_to_aim(model, aim_run, prefix="")
 
     # Save model
     model_path = MODELS_DIR / "lgbm_multioutput.pkl"

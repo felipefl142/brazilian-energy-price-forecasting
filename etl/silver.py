@@ -151,6 +151,54 @@ def _add_weather_features(long_df: pd.DataFrame) -> pd.DataFrame:
     return long_df
 
 
+def _add_thermal_dispatch_features(long_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join national thermal dispatch stress signals onto the long-format table.
+    Features are national (same value for all 4 subsystems in a given week).
+    Data available from 2013+; earlier rows get NaN (handled by the imputer).
+
+    thermal_emergency_mwmed: weekly sum of GFOM (out-of-merit emergency dispatch nationally).
+    thermal_nonmerit_share:  (GFOM + inflexibility) / total verified generation — stress ratio.
+    """
+    path = BRONZE_DIR / "thermal_dispatch.parquet"
+    feature_cols = [
+        "thermal_emergency_mwmed_lag_1w",
+        "thermal_nonmerit_share_lag_1w",
+        "thermal_emergency_mwmed_roll_4w",
+        "thermal_nonmerit_share_roll_4w",
+    ]
+    if not path.exists():
+        print("  [Silver] WARNING: thermal_dispatch.parquet not found, skipping thermal dispatch features")
+        for col in feature_cols:
+            long_df[col] = float("nan")
+        return long_df
+
+    con = duckdb.connect()
+    td_df = con.execute(f"""
+        SELECT
+            week_start,
+            LAG(thermal_emergency_mwmed, 1) OVER (ORDER BY week_start)
+                AS thermal_emergency_mwmed_lag_1w,
+            LAG(thermal_nonmerit_share, 1) OVER (ORDER BY week_start)
+                AS thermal_nonmerit_share_lag_1w,
+            AVG(thermal_emergency_mwmed) OVER (
+                ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+            ) AS thermal_emergency_mwmed_roll_4w,
+            AVG(thermal_nonmerit_share) OVER (
+                ORDER BY week_start ROWS BETWEEN 4 PRECEDING AND 1 PRECEDING
+            ) AS thermal_nonmerit_share_roll_4w
+        FROM read_parquet('{str(path)}')
+        ORDER BY week_start
+    """).fetchdf()
+    con.close()
+
+    td_df["week_start"] = pd.to_datetime(td_df["week_start"]).dt.date
+    long_df["week_start"] = pd.to_datetime(long_df["week_start"]).dt.date
+
+    long_df = long_df.merge(td_df, on="week_start", how="left")
+    return long_df
+
+
 def _add_ena_anomaly(long_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute ENA anomaly = ena_roll_4w / historical_avg(ena_roll_4w for same week-of-year).
@@ -216,6 +264,7 @@ def build_silver():
     # Step 3: per-subsystem features
     long_df = _add_load_features(long_df)
     long_df = _add_weather_features(long_df)
+    long_df = _add_thermal_dispatch_features(long_df)
 
     # Step 4: ENA anomaly
     long_df = _add_ena_anomaly(long_df)

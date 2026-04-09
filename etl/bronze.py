@@ -3,15 +3,16 @@ Bronze layer: schema normalization, type casting, subsystem mapping, and weekly 
 Reads hive-partitioned raw Parquet (as downloaded by collect.py) and writes clean weekly files.
 
 Output files (data/bronze/):
-  pld.parquet           — weekly PLD per subsystem (R$/MWh)
-  reservoir.parquet     — weekly reservoir storage (%) + ENA (GWh) per subsystem
-  generation.parquet    — weekly generation by fuel type, national (avg MW)
-  load.parquet          — weekly load per subsystem (MWh)
-  interconnection.parquet — daily interchange flows per subsystem pair (avg MWmed)
-  weather.parquet       — weekly weather per subsystem city (precip mm, temp °C)
+  pld.parquet              — weekly PLD per subsystem (R$/MWh)
+  reservoir.parquet        — weekly reservoir storage (% + MWmonth absolute) + ENA (GWh) per subsystem
+  generation.parquet       — weekly generation by fuel type, national (avg MW)
+  load.parquet             — weekly load per subsystem (MWh)
+  interconnection.parquet  — daily interchange flows per subsystem pair (avg MWmed)
+  weather.parquet          — weekly weather per subsystem city (precip mm, temp °C)
+  thermal_dispatch.parquet — weekly national thermal dispatch stress signals (emergency MWmed, non-merit share)
 
 Raw column names (verified April 2026):
-  EAR:           id_subsistema, ear_data, ear_verif_subsistema_percentual
+  EAR:           id_subsistema, ear_data, ear_verif_subsistema_percentual, ear_verif_subsistema_mwmes
   ENA:           id_subsistema, ena_data, ena_armazenavel_regiao_mwmed
   Load:          id_subsistema, din_instante, val_cargaenergiamwmed
   Generation:    din_instante, nom_tipocombustivel, val_geracao (string MWmed)
@@ -143,7 +144,8 @@ def _build_reservoir(con: duckdb.DuckDBPyConnection):
                 SELECT
                     {_friday_week('ear_data')} AS week_start,
                     {subsys_map} AS subsystem,
-                    AVG(TRY_CAST(ear_verif_subsistema_percentual AS DOUBLE)) AS reservoir_pct
+                    AVG(TRY_CAST(ear_verif_subsistema_percentual AS DOUBLE)) AS reservoir_pct,
+                    AVG(TRY_CAST(ear_verif_subsistema_mwmes AS DOUBLE))      AS reservoir_mwmonth
                 FROM read_parquet('{raw_ear}', hive_partitioning=true)
                 WHERE ear_data IS NOT NULL
                   AND ear_verif_subsistema_percentual IS NOT NULL
@@ -331,6 +333,45 @@ def _build_weather(con: duckdb.DuckDBPyConnection):
 
 
 # ---------------------------------------------------------------------------
+# Thermal dispatch stress signals (weekly national aggregates, 2013+)
+# ---------------------------------------------------------------------------
+
+def _build_thermal_dispatch(con: duckdb.DuckDBPyConnection):
+    raw = _raw_glob("thermal_dispatch")
+    out = str(BRONZE_DIR / "thermal_dispatch.parquet")
+    print("  [Bronze] Building thermal_dispatch.parquet...")
+
+    if not (RAW_DIR / "thermal_dispatch").exists():
+        print("    → No thermal dispatch data found, skipping.")
+        return
+
+    # Plant-patamar level → weekly national aggregates.
+    # thermal_emergency_mwmed: sum of GFOM (out-of-merit emergency dispatch) nationally.
+    # thermal_nonmerit_share:  (GFOM + inflexibility) / total verified generation —
+    #   signals how much thermal is running for non-economic reasons (stress indicator).
+    try:
+        con.execute(f"""
+            COPY (
+                SELECT
+                    {_friday_week('din_instante')} AS week_start,
+                    SUM(COALESCE(TRY_CAST(val_verifgfom AS DOUBLE), 0.0)) AS thermal_emergency_mwmed,
+                    (
+                        SUM(COALESCE(TRY_CAST(val_verifgfom AS DOUBLE), 0.0))
+                        + SUM(COALESCE(TRY_CAST(val_verifinflexibilidade AS DOUBLE), 0.0))
+                    ) / NULLIF(SUM(COALESCE(TRY_CAST(val_verifgeracao AS DOUBLE), 0.0)), 0)
+                        AS thermal_nonmerit_share
+                FROM read_parquet('{raw}', hive_partitioning=true)
+                WHERE din_instante IS NOT NULL
+                GROUP BY 1
+                ORDER BY 1
+            ) TO '{out}' (FORMAT PARQUET)
+        """)
+        print(f"    → {_row_count(con, Path(out)):,} rows")
+    except Exception as e:
+        print(f"    WARNING: thermal dispatch build failed ({e})")
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -344,6 +385,7 @@ def build_bronze():
     _build_load(con)
     _build_interconnection(con)
     _build_weather(con)
+    _build_thermal_dispatch(con)
 
     con.close()
     print("  [Bronze] Done.")

@@ -33,7 +33,7 @@ ABT_TEST_PATH = str(GOLD_DIR / "abt_test.parquet")
 FEAST_FEATURES_PATH = str(FEAST_DIR / "features.parquet")
 
 # Temporal split: OOT test = everything after this date
-TRAIN_END = "2023-12-31"
+TRAIN_END = "2024-12-31"
 
 
 def _row_count(con: duckdb.DuckDBPyConnection, path: str) -> int:

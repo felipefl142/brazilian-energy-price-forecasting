@@ -14,12 +14,13 @@ Data sources:
     - Weather: Open-Meteo archive API (hourly → aggregated daily, 4 cities per subsystem)
 
 ONS S3 URL patterns (verified April 2026 via package_show API):
-    EAR:            ear_subsistema_di/EAR_DIARIO_SUBSISTEMA_{year}.parquet        (2000+)
-    ENA:            ena_subsistema_di/ENA_DIARIO_SUBSISTEMA_{year}.{ext}           (parquet 2021+, csv 2000–2020)
-    Load:           carga_energia_di/CARGA_ENERGIA_{year}.parquet                 (2000+)
-    Generation:     geracao_usina_2_ho/GERACAO_USINA-2_{year}.parquet             (annual 2000–2021)
-                    geracao_usina_2_ho/GERACAO_USINA-2_{year}_{mm:02d}.parquet    (monthly 2022+)
-    Interconnection: intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.{ext}   (parquet 2023+, csv 2000–2022)
+    EAR:              ear_subsistema_di/EAR_DIARIO_SUBSISTEMA_{year}.parquet        (2000+)
+    ENA:              ena_subsistema_di/ENA_DIARIO_SUBSISTEMA_{year}.{ext}           (parquet 2021+, csv 2000–2020)
+    Load:             carga_energia_di/CARGA_ENERGIA_{year}.parquet                 (2000+)
+    Generation:       geracao_usina_2_ho/GERACAO_USINA-2_{year}.parquet             (annual 2000–2021)
+                      geracao_usina_2_ho/GERACAO_USINA-2_{year}_{mm:02d}.parquet    (monthly 2022+)
+    Interconnection:  intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.{ext}     (parquet 2023+, csv 2000–2022)
+    Thermal dispatch: geracao_termica_despacho_2_ho/GERACAO_TERMICA_DESPACHO-2_{year}_{mm:02d}.parquet (monthly 2013+)
 """
 
 import argparse
@@ -165,11 +166,12 @@ class CollectONS:
     Raw column names are preserved as-is; bronze.py normalises them.
 
     Datasets collected:
-      reservoir   — EAR daily by subsystem (% useful energy storage)
-      ena         — ENA daily by subsystem (natural inflows, MWmed)
-      load        — Daily energy load by subsystem (MWmed)
-      generation  — Daily generation by plant/fuel (MWmed), annual pre-2022 / monthly 2022+
-      interconnection — Daily interchange flows between subsystems (MWmed)
+      reservoir        — EAR daily by subsystem (% useful energy storage + absolute MWmonth)
+      ena              — ENA daily by subsystem (natural inflows, MWmed)
+      load             — Daily energy load by subsystem (MWmed)
+      generation       — Daily generation by plant/fuel (MWmed), annual pre-2022 / monthly 2022+
+      interconnection  — Daily interchange flows between subsystems (MWmed)
+      thermal_dispatch — Thermal generation by dispatch reason (plant/patamar level, monthly 2013+)
     """
 
     def _fetch_reservoir(self, year: int) -> pd.DataFrame | None:
@@ -207,6 +209,20 @@ class CollectONS:
         url = f"{ONS_S3}/intercambio_nacional_ho/INTERCAMBIO_NACIONAL_{year}.csv"
         return _read_csv_url(url)
 
+    def _fetch_thermal_dispatch(self, year: int) -> pd.DataFrame | None:
+        """Monthly Parquet files available from 2013+. Only keeps columns needed for bronze."""
+        if year < 2013:
+            return None
+        keep_cols = ["din_instante", "id_subsistema", "val_verifgeracao",
+                     "val_verifgfom", "val_verifinflexibilidade"]
+        frames = []
+        for month in range(1, 13):
+            url = f"{ONS_S3}/geracao_termica_despacho_2_ho/GERACAO_TERMICA_DESPACHO-2_{year}_{month:02d}.parquet"
+            df = _read_parquet_url(url)
+            if df is not None and not df.empty:
+                frames.append(df[[c for c in keep_cols if c in df.columns]])
+        return pd.concat(frames, ignore_index=True) if frames else None
+
     def _save(self, source_key: str, year: int, df: pd.DataFrame):
         out = _partition_path(source_key, year)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -215,11 +231,12 @@ class CollectONS:
 
     def process(self, start: datetime, end: datetime, force: bool = False):
         sources = {
-            "reservoir": self._fetch_reservoir,
-            "ena":        self._fetch_ena,
-            "load":       self._fetch_load,
-            "generation": self._fetch_generation,
-            "interconnection": self._fetch_interconnection,
+            "reservoir":        self._fetch_reservoir,
+            "ena":              self._fetch_ena,
+            "load":             self._fetch_load,
+            "generation":       self._fetch_generation,
+            "interconnection":  self._fetch_interconnection,
+            "thermal_dispatch": self._fetch_thermal_dispatch,
         }
         for source_key, fetch_fn in sources.items():
             print(f"\n[ONS/{source_key}] Starting collection...")

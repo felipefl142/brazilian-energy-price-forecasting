@@ -129,7 +129,7 @@ python -m pytest tests/ -v
 ## Known issues / open TODOs
 
 - `eda_03_features.ipynb` — generation column mapping is now resolved; notebook can be built
-- Train/test cut is hardcoded to `2023-12-31` in `ml/train.py::TRAIN_END`. Update annually.
+- Train/test cut is hardcoded to `2024-12-31` in `etl/gold.py::TRAIN_END`. Update annually.
 - OOT MAPE is inflated (~586%) because 2024 includes weeks with PLD near the floor (~R$30/MWh); MAE is more meaningful (~R$51 at t+1w, ~R$108 at t+4w)
 
 ## What NOT to do
